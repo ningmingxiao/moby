@@ -1,18 +1,32 @@
 package xfer // import "github.com/docker/docker/distribution/xfer"
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
+	b64 "encoding/base64"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/containerd/containerd/images"
+	"github.com/containers/ocicrypt"
+	encconfig "github.com/containers/ocicrypt/config"
+	encocispec "github.com/containers/ocicrypt/spec"
+	cryptUtils "github.com/containers/ocicrypt/utils"
 	"github.com/docker/distribution"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/progress"
+	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 )
 
@@ -88,6 +102,7 @@ type DownloadDescriptor interface {
 	// descriptor and will not call Download again or read from the reader
 	// that Download returned.
 	Close()
+	Desc() (ocispec.Descriptor, error)
 }
 
 // DigestRegisterer can be implemented by a DownloadDescriptor, and provides a
@@ -346,14 +361,56 @@ func (ldm *LayerDownloadManager) makeDownloadFunc(descriptor DownloadDescriptor,
 				return
 			}
 
+			desc, err := descriptor.Desc()
+			if err != nil {
+				d.err = err
+				return
+			}
+
+			var layerData io.Reader
+			if strings.HasSuffix(desc.MediaType, "+encrypted") {
+				var ocispec ocispec.Descriptor
+				keyPathCc, err := getDecryptionKeys("/etc/docker/ocicrypt/keys")
+
+				if err != nil {
+					d.err = err
+					return
+				}
+				dc := combineDecryptionConfigs(keyPathCc.DecryptConfig)
+				ocispec.Annotations = desc.Annotations
+				ocispec.MediaType = desc.MediaType
+				ocispec.Platform = desc.Platform
+				_, gzipData, _, err := DecryptLayer(dc, inflatedLayerData, ocispec, false)
+				if err != nil {
+					d.err = err
+					return
+				}
+				//tgz to tar
+				gr, err := gzip.NewReader(gzipData)
+				if err != nil {
+					d.err = err
+					return
+				}
+				defer gr.Close()
+				var buf bytes.Buffer
+				_, err = io.Copy(&buf, gr)
+				if err != nil {
+					d.err = err
+					return
+				}
+				layerData = bytes.NewReader(buf.Bytes())
+			} else {
+				layerData = inflatedLayerData
+			}
+
 			var src distribution.Descriptor
 			if fs, ok := descriptor.(distribution.Describable); ok {
 				src = fs.Descriptor()
 			}
 			if ds, ok := d.layerStore.(layer.DescribableStore); ok {
-				d.layer, err = ds.RegisterWithDescriptor(inflatedLayerData, parentLayer, src)
+				d.layer, err = ds.RegisterWithDescriptor(layerData, parentLayer, src)
 			} else {
-				d.layer, err = d.layerStore.Register(inflatedLayerData, parentLayer)
+				d.layer, err = d.layerStore.Register(layerData, parentLayer)
 			}
 			if err != nil {
 				select {
@@ -475,4 +532,70 @@ func (ldm *LayerDownloadManager) makeDownloadFuncFromDownload(descriptor Downloa
 
 		return d
 	}
+}
+
+func getDecryptionKeys(keysPath string) (encconfig.CryptoConfig, error) {
+	var cc encconfig.CryptoConfig
+	base64Keys := make([]string, 0)
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		// Handle symlinks
+		if info.Mode()&os.ModeSymlink == os.ModeSymlink {
+			return errors.New("Symbolic links not supported in decryption keys paths")
+		}
+		privateKey, err := ioutil.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		// TODO - Remove the need to covert to base64. The ocicrypt library
+		// should provide a method to directly process the private keys
+		sEnc := b64.StdEncoding.EncodeToString(privateKey)
+		base64Keys = append(base64Keys, sEnc)
+		return nil
+	}
+	err := filepath.Walk(keysPath, walkFn)
+	if err != nil {
+		return cc, err
+	}
+	sortedDc, err := cryptUtils.SortDecryptionKeys(strings.Join(base64Keys, ","))
+	if err != nil {
+		return cc, err
+	}
+	cc = encconfig.InitDecryption(sortedDc)
+	return cc, nil
+}
+
+func combineDecryptionConfigs(dc1 *encconfig.DecryptConfig) *encconfig.DecryptConfig {
+	cc1 := encconfig.CryptoConfig{
+		DecryptConfig: dc1,
+	}
+	cc := encconfig.CombineCryptoConfigs([]encconfig.CryptoConfig{cc1})
+	return cc.DecryptConfig
+}
+
+func DecryptLayer(dc *encconfig.DecryptConfig, dataReader io.Reader, desc ocispec.Descriptor, unwrapOnly bool) (ocispec.Descriptor, io.Reader, digest.Digest, error) {
+	resultReader, layerDigest, err := ocicrypt.DecryptLayer(dc, dataReader, desc, unwrapOnly)
+	if err != nil || unwrapOnly {
+		return ocispec.Descriptor{}, nil, "", err
+	}
+
+	newDesc := ocispec.Descriptor{
+		Size:     0,
+		Platform: desc.Platform,
+	}
+	switch desc.MediaType {
+	case encocispec.MediaTypeLayerGzipEnc:
+		newDesc.MediaType = images.MediaTypeDockerSchema2LayerGzip
+	case encocispec.MediaTypeLayerEnc:
+		newDesc.MediaType = images.MediaTypeDockerSchema2Layer
+	default:
+		return ocispec.Descriptor{}, nil, "", fmt.Errorf("unsupporter layer MediaType: %s", desc.MediaType)
+	}
+	return newDesc, resultReader, layerDigest, nil
 }

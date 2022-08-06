@@ -646,6 +646,11 @@ func (ld *layerDescriptor) Close() {
 	// ld.is.ContentStore.Delete(context.TODO(), ld.desc.Digest))
 }
 
+func (ld *layerDescriptor) Desc() (ocispec.Descriptor, error) {
+	return ld.desc,nil
+}
+
+
 func (ld *layerDescriptor) Registered(diffID layer.DiffID) {
 	// Cache mapping from this layer's DiffID to the blobsum
 	ld.is.MetadataStore.Add(diffID, metadata.V2Metadata{Digest: ld.desc.Digest, SourceRepository: ld.ref.Locator})

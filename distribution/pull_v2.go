@@ -325,6 +325,19 @@ func (ld *layerDescriptor) Close() {
 	}
 }
 
+func (ld *layerDescriptor) Desc() (specs.Descriptor, error) {
+	var ociSpec specs.Descriptor
+	ociSpec.Size = ld.src.Size
+	ociSpec.Annotations = ld.src.Annotations
+	ociSpec.MediaType = ld.src.MediaType
+	ociSpec.Platform = ld.src.Platform
+	ociSpec.Digest = ld.src.Digest
+	ociSpec.URLs = ld.src.URLs
+	return ociSpec,nil
+}
+
+
+
 func (ld *layerDescriptor) truncateDownloadFile() error {
 	// Need a new hash context since we will be redoing the download
 	ld.verifier = nil
